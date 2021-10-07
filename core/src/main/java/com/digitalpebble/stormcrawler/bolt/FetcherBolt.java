@@ -84,6 +84,13 @@ public class FetcherBolt extends StatusEmitterBolt {
      **/
     public static final String QUEUED_TIMEOUT_PARAM_KEY = "fetcher.timeout.queue";
 
+    /**
+     * Key name of the http client custom implementation defined in the config file
+     **/
+    private static final String CUSTOM_PROTOCOL_KEY_NAME = "custom.protocol";
+
+    private static final String FETCHER_DELAY_KEY_NAME = "fetcher.delay";
+
     private final AtomicInteger activeThreads = new AtomicInteger(0);
     private final AtomicInteger spinWaiting = new AtomicInteger(0);
 
@@ -200,7 +207,7 @@ public class FetcherBolt extends StatusEmitterBolt {
         private final AtomicInteger inProgress = new AtomicInteger();
         private final AtomicLong nextFetchTime = new AtomicLong();
 
-        private final long minCrawlDelay;
+        private long minCrawlDelay;
         private final int maxThreads;
 
         long crawlDelay;
@@ -323,7 +330,8 @@ public class FetcherBolt extends StatusEmitterBolt {
         /** @return true if the URL has been added, false otherwise **/
         public synchronized boolean addFetchItem(URL u, String url, Tuple input) {
             FetchItem it = FetchItem.create(u, url, input, queueMode);
-            FetchItemQueue fiq = getFetchItemQueue(it.queueID);
+            final Metadata metadata = (Metadata) input.getValueByField("metadata");
+            FetchItemQueue fiq = getFetchItemQueue(it.queueID, metadata);
             boolean added = fiq.addFetchItem(it);
             if (added) {
                 inQueues.incrementAndGet();
@@ -344,8 +352,12 @@ public class FetcherBolt extends StatusEmitterBolt {
             fiq.finishFetchItem(it, asap);
         }
 
-        public synchronized FetchItemQueue getFetchItemQueue(String id) {
+        public synchronized FetchItemQueue getFetchItemQueue(String id, Metadata metadata) {
             FetchItemQueue fiq = queues.get(id);
+            // custom fetcherDelay from metadata?
+            final long customFetcherDelay = metadata != null && metadata.getFirstValue(FETCHER_DELAY_KEY_NAME) != null
+                    ? Long.parseLong(metadata.getFirstValue(FETCHER_DELAY_KEY_NAME))
+                    : minCrawlDelay;
             if (fiq == null) {
                 int customThreadVal = defaultMaxThread;
                 // custom maxThread value?
@@ -357,8 +369,13 @@ public class FetcherBolt extends StatusEmitterBolt {
                 }
                 // initialize queue
                 fiq = new FetchItemQueue(customThreadVal, crawlDelay,
-                        minCrawlDelay, maxQueueSize);
+                        customFetcherDelay, maxQueueSize);
                 queues.put(id, fiq);
+            }
+            // in case we have ip partitioning, for example two different seeds with the same ip that will
+            // be in the same queue, each one with custom fetcher delay, we take the less aggressive
+            if(fiq.minCrawlDelay < customFetcherDelay) {
+                fiq.minCrawlDelay = customFetcherDelay;
             }
             return fiq;
         }
@@ -501,7 +518,10 @@ public class FetcherBolt extends StatusEmitterBolt {
 
                 try {
                     URL url = new URL(fit.url);
-                    Protocol protocol = protocolFactory.getProtocol(url);
+                    final String customProtocol = metadata.getFirstValue(CUSTOM_PROTOCOL_KEY_NAME);
+                    Protocol protocol = customProtocol != null && !customProtocol.isEmpty()
+                            ? protocolFactory.getProtocol(customProtocol)
+                            : protocolFactory.getProtocol(url);
 
                     if (protocol == null)
                         throw new RuntimeException(
@@ -566,7 +586,7 @@ public class FetcherBolt extends StatusEmitterBolt {
                         continue;
                     }
                     FetchItemQueue fiq = fetchQueues
-                            .getFetchItemQueue(fit.queueID);
+                            .getFetchItemQueue(fit.queueID, metadata);
                     if (rules.getCrawlDelay() > 0
                             && rules.getCrawlDelay() != fiq.crawlDelay) {
                         if (rules.getCrawlDelay() > maxCrawlDelay
