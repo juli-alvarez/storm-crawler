@@ -84,11 +84,6 @@ public class FetcherBolt extends StatusEmitterBolt {
      **/
     public static final String QUEUED_TIMEOUT_PARAM_KEY = "fetcher.timeout.queue";
 
-    /**
-     * Key name of the http client custom implementation defined in the config file
-     **/
-    private static final String CUSTOM_PROTOCOL_KEY_NAME = "custom.protocol";
-
     private static final String FETCHER_DELAY_KEY_NAME = "fetcher.delay";
 
     private final AtomicInteger activeThreads = new AtomicInteger(0);
@@ -518,10 +513,7 @@ public class FetcherBolt extends StatusEmitterBolt {
 
                 try {
                     URL url = new URL(fit.url);
-                    final String customProtocol = metadata.getFirstValue(CUSTOM_PROTOCOL_KEY_NAME);
-                    Protocol protocol = customProtocol != null && !customProtocol.isEmpty()
-                            ? protocolFactory.getProtocol(customProtocol)
-                            : protocolFactory.getProtocol(url);
+                    Protocol protocol = protocolFactory.getProtocol(url);
 
                     if (protocol == null)
                         throw new RuntimeException(
