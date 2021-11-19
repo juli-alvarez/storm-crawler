@@ -58,6 +58,7 @@ import org.apache.http.util.ByteArrayBuffer;
 import org.apache.storm.Config;
 import org.slf4j.LoggerFactory;
 
+import com.digitalpebble.stormcrawler.Constants;
 import com.digitalpebble.stormcrawler.Metadata;
 import com.digitalpebble.stormcrawler.persistence.Status;
 import com.digitalpebble.stormcrawler.protocol.AbstractHttpProtocol;
@@ -78,7 +79,7 @@ public class HttpProtocol extends AbstractHttpProtocol implements
 
     private static final PoolingHttpClientConnectionManager CONNECTION_MANAGER = new PoolingHttpClientConnectionManager();
 
-    private int maxContent;
+    private int globalMaxContent;
 
     private HttpClientBuilder builder;
 
@@ -102,7 +103,7 @@ public class HttpProtocol extends AbstractHttpProtocol implements
         }
         CONNECTION_MANAGER.setDefaultMaxPerRoute(maxPerRoute);
 
-        this.maxContent = ConfUtils.getInt(conf, "http.content.limit", -1);
+        globalMaxContent = ConfUtils.getInt(conf, "http.content.limit", -1);
 
         String userAgent = getAgentString(conf);
 
@@ -112,7 +113,11 @@ public class HttpProtocol extends AbstractHttpProtocol implements
         if (StringUtils.isNotBlank(accept)) {
             defaultHeaders.add(new BasicHeader("Accept", accept));
         }
-
+        
+        customHeaders.forEach(h -> {
+            defaultHeaders.add(new BasicHeader(h.getKey(), h.getValue()));
+            });
+       
         String basicAuthUser = ConfUtils.getString(conf, "http.basicauth.user",
                 null);
 
@@ -173,29 +178,34 @@ public class HttpProtocol extends AbstractHttpProtocol implements
                 requestConfigBuilder.setProxyPreferredAuthSchemes(authSchemes);
 
                 BasicCredentialsProvider basicAuthCreds = new BasicCredentialsProvider();
-                basicAuthCreds.setCredentials(
-                        new AuthScope(prox.getAddress(), Integer.parseInt(prox.getPort())),
-                        new UsernamePasswordCredentials(prox.getUsername(), prox.getPassword())
-                );
+                basicAuthCreds.setCredentials(new AuthScope(prox.getAddress(),
+                        Integer.parseInt(prox.getPort())),
+                        new UsernamePasswordCredentials(prox.getUsername(),
+                                prox.getPassword()));
                 builder.setDefaultCredentialsProvider(basicAuthCreds);
             }
 
-            HttpHost proxy = new HttpHost(prox.getAddress(), Integer.parseInt(prox.getPort()));
-            DefaultProxyRoutePlanner routePlanner = new DefaultProxyRoutePlanner(proxy);
+            HttpHost proxy = new HttpHost(prox.getAddress(),
+                    Integer.parseInt(prox.getPort()));
+            DefaultProxyRoutePlanner routePlanner = new DefaultProxyRoutePlanner(
+                    proxy);
             builder.setRoutePlanner(routePlanner);
 
-            // save start time for debugging speed impact of request config build
+            // save start time for debugging speed impact of request config
+            // build
             long buildStart = System.currentTimeMillis();
 
             // set request config to new configuration with dynamic proxy
             reqConfig = requestConfigBuilder.build();
 
-            LOG.debug("time to build http request config with proxy: {}ms", System.currentTimeMillis() - buildStart);
+            LOG.debug("time to build http request config with proxy: {}ms",
+                    System.currentTimeMillis() - buildStart);
 
             LOG.debug("fetching with " + prox.toString());
         }
 
         HttpRequestBase request = new HttpGet(url);
+        ResponseHandler<ProtocolResponse> responseHandler = this;
 
         if (md != null) {
             String useHead = md.getFirstValue("http.method.head");
@@ -225,6 +235,16 @@ public class HttpProtocol extends AbstractHttpProtocol implements
                         acceptLanguage));
             }
 
+            String pageMaxContentStr = md.getFirstValue("http.content.limit");
+            if (StringUtils.isNotBlank(pageMaxContentStr)) {
+                try {
+                    int pageMaxContent = Integer.parseInt(pageMaxContentStr);
+                    responseHandler = getResponseHandlerWithContentLimit(pageMaxContent);
+                } catch (NumberFormatException e) {
+                    LOG.warn("Invalid http.content.limit in metadata: {}", pageMaxContentStr);
+                }
+            }
+
             if (useCookies) {
                 addCookiesToRequest(request, md);
             }
@@ -235,12 +255,13 @@ public class HttpProtocol extends AbstractHttpProtocol implements
         // no need to release the connection explicitly as this is handled
         // automatically. The client itself must be closed though.
         try (CloseableHttpClient httpclient = builder.build()) {
-            return httpclient.execute(request, this);
+            return httpclient.execute(request, responseHandler);
         }
     }
 
     private void addCookiesToRequest(HttpRequestBase request, Metadata md) {
-        String[] cookieStrings = md.getValues(RESPONSE_COOKIES_HEADER, protocolMDprefix);
+        String[] cookieStrings = md.getValues(RESPONSE_COOKIES_HEADER,
+                protocolMDprefix);
         if (cookieStrings != null && cookieStrings.length > 0) {
             List<Cookie> cookies;
             try {
@@ -258,7 +279,11 @@ public class HttpProtocol extends AbstractHttpProtocol implements
     @Override
     public ProtocolResponse handleResponse(HttpResponse response)
             throws IOException {
+        return handleResponseWithContentLimit(response, globalMaxContent);
+    }
 
+    public ProtocolResponse handleResponseWithContentLimit(
+            HttpResponse response, int maxContent) throws IOException {
         StatusLine statusLine = response.getStatusLine();
         int status = statusLine.getStatusCode();
 
@@ -300,6 +325,16 @@ public class HttpProtocol extends AbstractHttpProtocol implements
         return new ProtocolResponse(bytes, status, metadata);
     }
 
+    private ResponseHandler<ProtocolResponse> getResponseHandlerWithContentLimit(
+            int pageMaxContent) {
+        return new ResponseHandler<ProtocolResponse>() {
+            public ProtocolResponse handleResponse(final HttpResponse response)
+                    throws IOException {
+                return handleResponseWithContentLimit(response, pageMaxContent);
+            }
+        };
+    }
+
     private static final byte[] toByteArray(final HttpEntity entity,
             int maxContent, MutableBoolean trimmed) throws IOException {
 
@@ -310,7 +345,7 @@ public class HttpProtocol extends AbstractHttpProtocol implements
         if (instream == null) {
             return null;
         }
-        Args.check(entity.getContentLength() <= Integer.MAX_VALUE,
+        Args.check(entity.getContentLength() <= Constants.MAX_ARRAY_SIZE,
                 "HTTP entity too large to be buffered in memory");
         int reportedLength = (int) entity.getContentLength();
         // set default size for buffer: 100 KB

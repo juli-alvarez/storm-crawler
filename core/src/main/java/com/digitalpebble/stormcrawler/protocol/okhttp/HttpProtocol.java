@@ -39,18 +39,19 @@ import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 
-import com.digitalpebble.stormcrawler.proxy.*;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.mutable.MutableObject;
 import org.apache.http.cookie.Cookie;
 import org.apache.storm.Config;
 import org.slf4j.LoggerFactory;
 
+import com.digitalpebble.stormcrawler.Constants;
 import com.digitalpebble.stormcrawler.Metadata;
 import com.digitalpebble.stormcrawler.protocol.AbstractHttpProtocol;
 import com.digitalpebble.stormcrawler.protocol.HttpHeaders;
 import com.digitalpebble.stormcrawler.protocol.ProtocolResponse;
 import com.digitalpebble.stormcrawler.protocol.ProtocolResponse.TrimmedContentReason;
+import com.digitalpebble.stormcrawler.proxy.SCProxy;
 import com.digitalpebble.stormcrawler.util.ConfUtils;
 import com.digitalpebble.stormcrawler.util.CookieConverter;
 
@@ -58,6 +59,7 @@ import okhttp3.Call;
 import okhttp3.Connection;
 import okhttp3.Credentials;
 import okhttp3.EventListener;
+import okhttp3.EventListener.Factory;
 import okhttp3.Headers;
 import okhttp3.Interceptor;
 import okhttp3.MediaType;
@@ -69,7 +71,7 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
 import okhttp3.Route;
-import okhttp3.EventListener.Factory;
+import okhttp3.brotli.BrotliInterceptor;
 import okio.BufferedSource;
 
 public class HttpProtocol extends AbstractHttpProtocol {
@@ -82,14 +84,14 @@ public class HttpProtocol extends AbstractHttpProtocol {
 
     private OkHttpClient client;
 
-    private int maxContent;
+    private int globalMaxContent;
 
     private int completionTimeout = -1;
 
     /** Accept partially fetched content as trimmed content */
     private boolean partialContentAsTrimmed = false;
 
-    private final List<String[]> customRequestHeaders = new LinkedList<>();
+    private final List<KeyValue> customRequestHeaders = new LinkedList<>();
 
     // track the time spent for each URL in DNS resolution
     private final Map<String, Long> DNStimes = new HashMap<>();
@@ -132,7 +134,7 @@ public class HttpProtocol extends AbstractHttpProtocol {
     public void configure(Config conf) {
         super.configure(conf);
 
-        this.maxContent = ConfUtils.getInt(conf, "http.content.limit", -1);
+        globalMaxContent = ConfUtils.getInt(conf, "http.content.limit", -1);
 
         int timeout = ConfUtils.getInt(conf, "http.timeout", 10000);
 
@@ -183,19 +185,19 @@ public class HttpProtocol extends AbstractHttpProtocol {
 
         String userAgent = getAgentString(conf);
         if (StringUtils.isNotBlank(userAgent)) {
-            customRequestHeaders.add(new String[] { "User-Agent", userAgent });
+            customRequestHeaders.add(new KeyValue("User-Agent", userAgent));
         }
 
         String accept = ConfUtils.getString(conf, "http.accept");
         if (StringUtils.isNotBlank(accept)) {
-            customRequestHeaders.add(new String[] { "Accept", accept });
+            customRequestHeaders.add(new KeyValue("Accept", accept));
         }
 
         String acceptLanguage = ConfUtils.getString(conf,
                 "http.accept.language");
         if (StringUtils.isNotBlank(acceptLanguage)) {
             customRequestHeaders
-                    .add(new String[] { "Accept-Language", acceptLanguage });
+                    .add(new KeyValue("Accept-Language", acceptLanguage));
         }
 
         String basicAuthUser = ConfUtils.getString(conf, "http.basicauth.user",
@@ -208,8 +210,10 @@ public class HttpProtocol extends AbstractHttpProtocol {
             String encoding = Base64.getEncoder().encodeToString(
                     (basicAuthUser + ":" + basicAuthPass).getBytes());
             customRequestHeaders
-                    .add(new String[] { "Authorization", "Basic " + encoding });
+                    .add(new KeyValue("Authorization", "Basic " + encoding));
         }
+        
+        customHeaders.forEach(customRequestHeaders::add);
 
         if (storeHTTPHeaders) {
             builder.addNetworkInterceptor(new HTTPHeadersInterceptor());
@@ -232,6 +236,9 @@ public class HttpProtocol extends AbstractHttpProtocol {
                 return new DNSResolutionListener(DNStimes);
             }
         });
+
+        // enable support for Brotli compression (Content-Encoding)
+        builder.addInterceptor(BrotliInterceptor.INSTANCE);
 
         client = builder.build();
     }
@@ -296,8 +303,10 @@ public class HttpProtocol extends AbstractHttpProtocol {
 
         Builder rb = new Request.Builder().url(url);
         customRequestHeaders.forEach((k) -> {
-            rb.header(k[0], k[1]);
+            rb.header(k.getKey(), k.getValue());
         });
+
+        int pageMaxContent = globalMaxContent;
 
         if (metadata != null) {
             String lastModified = metadata
@@ -324,14 +333,28 @@ public class HttpProtocol extends AbstractHttpProtocol {
                 rb.header("Accept-Language", acceptLanguage);
             }
 
+            String pageMaxContentStr = metadata.getFirstValue("http.content.limit");
+            if (StringUtils.isNotBlank(pageMaxContentStr)) {
+                try {
+                    pageMaxContent = Integer.parseInt(pageMaxContentStr);
+                } catch (NumberFormatException e) {
+                    LOG.warn("Invalid http.content.limit in metadata: {}", pageMaxContentStr);
+                }
+            }
+
             if (useCookies) {
                 addCookiesToRequest(rb, url, metadata);
             }
 
             String postJSONData = metadata.getFirstValue("http.post.json");
             if (StringUtils.isNotBlank(postJSONData)) {
-                RequestBody body = RequestBody.create(JSON, postJSONData);
+                RequestBody body = RequestBody.create(postJSONData, JSON);
                 rb.post(body);
+            }
+
+            String useHead = metadata.getFirstValue("http.method.head");
+            if ("true".equalsIgnoreCase(useHead)) {
+                rb.head();
             }
         }
 
@@ -360,7 +383,7 @@ public class HttpProtocol extends AbstractHttpProtocol {
 
             MutableObject trimmed = new MutableObject(
                     TrimmedContentReason.NOT_TRIMMED);
-            bytes = toByteArray(response.body(), trimmed);
+            bytes = toByteArray(response.body(), pageMaxContent, trimmed);
             if (trimmed.getValue() != TrimmedContentReason.NOT_TRIMMED) {
                 if (!call.isCanceled()) {
                     call.cancel();
@@ -385,13 +408,13 @@ public class HttpProtocol extends AbstractHttpProtocol {
     }
 
     private final byte[] toByteArray(final ResponseBody responseBody,
-            MutableObject trimmed) throws IOException {
+            int maxContent, MutableObject trimmed) throws IOException {
 
         if (responseBody == null) {
             return new byte[] {};
         }
 
-        int maxContentBytes = Integer.MAX_VALUE;
+        int maxContentBytes = Constants.MAX_ARRAY_SIZE;
         if (maxContent != -1) {
             maxContentBytes = Math.min(maxContentBytes, maxContent);
         }
@@ -411,7 +434,7 @@ public class HttpProtocol extends AbstractHttpProtocol {
              * request one byte more than required to reliably detect truncated
              * content, but beware of integer overflows
              */
-            (maxContentBytes == Integer.MAX_VALUE ? maxContentBytes
+            (maxContentBytes == Constants.MAX_ARRAY_SIZE ? maxContentBytes
                     : (1 + maxContentBytes)) - bytesRequested);
             boolean success = false;
             try {
